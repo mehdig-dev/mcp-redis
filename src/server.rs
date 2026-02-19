@@ -73,6 +73,62 @@ pub struct KeyParams {
     pub key: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HashFieldParams {
+    #[schemars(description = "Connection name (optional if only one Redis instance is connected)")]
+    #[serde(default)]
+    pub connection: Option<String>,
+
+    #[schemars(description = "Hash key name")]
+    pub key: String,
+
+    #[schemars(description = "Comma-separated field names to retrieve")]
+    pub fields: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListRangeParams {
+    #[schemars(description = "Connection name (optional if only one Redis instance is connected)")]
+    #[serde(default)]
+    pub connection: Option<String>,
+
+    #[schemars(description = "List key name")]
+    pub key: String,
+
+    #[schemars(description = "Start index (default: 0)")]
+    #[serde(default)]
+    pub start: Option<i64>,
+
+    #[schemars(description = "Stop index, inclusive (default: -1 for end of list)")]
+    #[serde(default)]
+    pub stop: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetMembersParams {
+    #[schemars(description = "Connection name (optional if only one Redis instance is connected)")]
+    #[serde(default)]
+    pub connection: Option<String>,
+
+    #[schemars(description = "Set or sorted set key name")]
+    pub key: String,
+
+    #[schemars(description = "Maximum number of members to return (for large sets)")]
+    #[serde(default)]
+    pub count: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SlowlogParams {
+    #[schemars(description = "Connection name (optional if only one Redis instance is connected)")]
+    #[serde(default)]
+    pub connection: Option<String>,
+
+    #[schemars(description = "Number of entries to return (default: 10)")]
+    #[serde(default)]
+    pub count: Option<u32>,
+}
+
 impl McpRedisServer {
     pub fn new(connections: Vec<RedisConnection>, allow_write: bool, scan_count: u32) -> Self {
         Self {
@@ -415,6 +471,254 @@ impl McpRedisServer {
         .unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
+
+    pub async fn do_get_hash_fields(
+        &self,
+        params: HashFieldParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let entry = self
+            .resolve(params.connection.as_deref())
+            .map_err(|e| self.err(e))?;
+        let mut conn = entry.conn.clone();
+
+        let fields: Vec<&str> = params.fields.split(',').map(|f| f.trim()).collect();
+
+        let mut cmd = redis::cmd("HMGET");
+        cmd.arg(&params.key);
+        for field in &fields {
+            cmd.arg(*field);
+        }
+
+        let values: Vec<Option<String>> = cmd
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| self.err(McpRedisError::Redis(e)))?;
+
+        let result: Vec<serde_json::Value> = fields
+            .iter()
+            .zip(values.iter())
+            .map(|(field, value)| {
+                serde_json::json!({
+                    "field": field,
+                    "value": value.as_deref().unwrap_or_default(),
+                    "exists": value.is_some(),
+                })
+            })
+            .collect();
+
+        let text = serde_json::to_string_pretty(&serde_json::json!({
+            "key": params.key,
+            "fields": result,
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    pub async fn do_get_list_range(
+        &self,
+        params: ListRangeParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let entry = self
+            .resolve(params.connection.as_deref())
+            .map_err(|e| self.err(e))?;
+        let mut conn = entry.conn.clone();
+
+        let start = params.start.unwrap_or(0);
+        let stop = params.stop.unwrap_or(-1);
+
+        let elements: Vec<String> = redis::cmd("LRANGE")
+            .arg(&params.key)
+            .arg(start)
+            .arg(stop)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| self.err(McpRedisError::Redis(e)))?;
+
+        let text = serde_json::to_string_pretty(&serde_json::json!({
+            "key": params.key,
+            "start": start,
+            "stop": stop,
+            "elements": elements,
+            "count": elements.len(),
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    pub async fn do_get_set_members(
+        &self,
+        params: SetMembersParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let entry = self
+            .resolve(params.connection.as_deref())
+            .map_err(|e| self.err(e))?;
+        let mut conn = entry.conn.clone();
+
+        // Detect key type to handle sets vs sorted sets
+        let key_type: String = redis::cmd("TYPE")
+            .arg(&params.key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| self.err(McpRedisError::Redis(e)))?;
+
+        match key_type.as_str() {
+            "set" => {
+                let members: Vec<String> = redis::cmd("SMEMBERS")
+                    .arg(&params.key)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| self.err(McpRedisError::Redis(e)))?;
+
+                let limited = if let Some(count) = params.count {
+                    members.into_iter().take(count as usize).collect::<Vec<_>>()
+                } else {
+                    members
+                };
+
+                let text = serde_json::to_string_pretty(&serde_json::json!({
+                    "key": params.key,
+                    "type": "set",
+                    "members": limited,
+                    "count": limited.len(),
+                }))
+                .unwrap_or_else(|_| "{}".to_string());
+                Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
+            "zset" => {
+                let stop = params.count.map(|c| c - 1).unwrap_or(-1);
+                let members: Vec<(String, f64)> = redis::cmd("ZRANGE")
+                    .arg(&params.key)
+                    .arg(0)
+                    .arg(stop)
+                    .arg("WITHSCORES")
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| self.err(McpRedisError::Redis(e)))?;
+
+                let result: Vec<serde_json::Value> = members
+                    .iter()
+                    .map(|(m, s)| serde_json::json!({"member": m, "score": s}))
+                    .collect();
+
+                let text = serde_json::to_string_pretty(&serde_json::json!({
+                    "key": params.key,
+                    "type": "zset",
+                    "members": result,
+                    "count": result.len(),
+                }))
+                .unwrap_or_else(|_| "{}".to_string());
+                Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
+            "none" => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::json!({"error": "Key does not exist", "key": params.key}).to_string(),
+            )])),
+            other => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::json!({"error": format!("Key is type '{}', not a set or zset", other), "key": params.key}).to_string(),
+            )])),
+        }
+    }
+
+    pub async fn do_slowlog(&self, params: SlowlogParams) -> Result<CallToolResult, ErrorData> {
+        let entry = self
+            .resolve(params.connection.as_deref())
+            .map_err(|e| self.err(e))?;
+        let mut conn = entry.conn.clone();
+
+        let count = params.count.unwrap_or(10);
+
+        // SLOWLOG GET returns an array of arrays
+        let raw: Vec<Vec<redis::Value>> = redis::cmd("SLOWLOG")
+            .arg("GET")
+            .arg(count)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| self.err(McpRedisError::Redis(e)))?;
+
+        let entries: Vec<serde_json::Value> = raw
+            .iter()
+            .map(|entry| {
+                let id = match entry.first() {
+                    Some(redis::Value::Int(i)) => *i,
+                    _ => -1,
+                };
+                let timestamp = match entry.get(1) {
+                    Some(redis::Value::Int(i)) => *i,
+                    _ => 0,
+                };
+                let duration_us = match entry.get(2) {
+                    Some(redis::Value::Int(i)) => *i,
+                    _ => 0,
+                };
+                let command = match entry.get(3) {
+                    Some(redis::Value::Array(args)) => args
+                        .iter()
+                        .filter_map(|a| match a {
+                            redis::Value::BulkString(s) => {
+                                String::from_utf8(s.clone()).ok()
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    _ => "unknown".to_string(),
+                };
+
+                serde_json::json!({
+                    "id": id,
+                    "timestamp": timestamp,
+                    "duration_us": duration_us,
+                    "command": command,
+                })
+            })
+            .collect();
+
+        let text = serde_json::to_string_pretty(&serde_json::json!({
+            "entries": entries,
+            "count": entries.len(),
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    pub async fn do_client_list(
+        &self,
+        params: ConnectionParam,
+    ) -> Result<CallToolResult, ErrorData> {
+        let entry = self
+            .resolve(params.connection.as_deref())
+            .map_err(|e| self.err(e))?;
+        let mut conn = entry.conn.clone();
+
+        let raw: String = redis::cmd("CLIENT")
+            .arg("LIST")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| self.err(McpRedisError::Redis(e)))?;
+
+        let clients: Vec<serde_json::Value> = raw
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let mut map = serde_json::Map::new();
+                for part in line.split(' ') {
+                    if let Some((key, value)) = part.split_once('=') {
+                        map.insert(
+                            key.to_string(),
+                            serde_json::Value::String(value.to_string()),
+                        );
+                    }
+                }
+                serde_json::Value::Object(map)
+            })
+            .collect();
+
+        let text = serde_json::to_string_pretty(&serde_json::json!({
+            "clients": clients,
+            "count": clients.len(),
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
 }
 
 // -- MCP tool handlers (thin wrappers) --
@@ -494,6 +798,61 @@ impl McpRedisServer {
     ) -> Result<CallToolResult, ErrorData> {
         self.do_search_keys(params).await
     }
+
+    #[tool(
+        name = "get_hash_fields",
+        description = "Get specific fields from a hash key using HMGET"
+    )]
+    async fn get_hash_fields(
+        &self,
+        Parameters(params): Parameters<HashFieldParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_get_hash_fields(params).await
+    }
+
+    #[tool(
+        name = "get_list_range",
+        description = "Get a range of elements from a list key using LRANGE"
+    )]
+    async fn get_list_range(
+        &self,
+        Parameters(params): Parameters<ListRangeParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_get_list_range(params).await
+    }
+
+    #[tool(
+        name = "get_set_members",
+        description = "Get members of a set (SMEMBERS) or sorted set (ZRANGE with scores)"
+    )]
+    async fn get_set_members(
+        &self,
+        Parameters(params): Parameters<SetMembersParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_get_set_members(params).await
+    }
+
+    #[tool(
+        name = "slowlog",
+        description = "Get slow query log entries for performance debugging"
+    )]
+    async fn slowlog(
+        &self,
+        Parameters(params): Parameters<SlowlogParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_slowlog(params).await
+    }
+
+    #[tool(
+        name = "client_list",
+        description = "List connected Redis clients with address, name, idle time, and current command"
+    )]
+    async fn client_list(
+        &self,
+        Parameters(params): Parameters<ConnectionParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_client_list(params).await
+    }
 }
 
 #[tool_handler]
@@ -508,9 +867,12 @@ impl ServerHandler for McpRedisServer {
                 ..Default::default()
             },
             instructions: Some(
-                "Redis server. Use list_connections to see connected instances, \
-                 info for server statistics, scan_keys to find keys by pattern, \
-                 get to retrieve values, key_info for metadata, and dbsize for key count."
+                "Redis server. Tools: list_connections (instances), info (server stats), \
+                 scan_keys (find keys), get (retrieve values), key_info (metadata), \
+                 dbsize (key count), search_keys (keys with types), \
+                 get_hash_fields (hash HMGET), get_list_range (list LRANGE), \
+                 get_set_members (set/zset members), slowlog (slow queries), \
+                 client_list (connected clients)."
                     .to_string(),
             ),
         }

@@ -1,5 +1,6 @@
 use mcp_redis::server::{
-    ConnectionParam, InfoParams, KeyParams, McpRedisServer, RedisConnection, ScanParams,
+    ConnectionParam, HashFieldParams, InfoParams, KeyParams, ListRangeParams, McpRedisServer,
+    RedisConnection, ScanParams, SetMembersParams, SlowlogParams,
 };
 
 /// Try to connect to Redis with a short timeout. Skip tests if not available.
@@ -269,4 +270,231 @@ async fn test_resolve_ambiguous() {
     let json = extract_text(result);
     let arr = json.as_array().expect("should be array");
     assert_eq!(arr.len(), 2);
+}
+
+// -- New tool tests --
+
+#[tokio::test]
+async fn test_get_hash_fields() {
+    let conn = require_redis!();
+    let mut test_conn = conn.conn.clone();
+    let _: () = redis::cmd("HSET")
+        .arg("h1")
+        .arg("a")
+        .arg("1")
+        .arg("b")
+        .arg("2")
+        .arg("c")
+        .arg("3")
+        .query_async(&mut test_conn)
+        .await
+        .unwrap();
+
+    let server = make_server(conn);
+    let params = HashFieldParams {
+        connection: None,
+        key: "h1".to_string(),
+        fields: "a, c".to_string(),
+    };
+    let result = server
+        .do_get_hash_fields(params)
+        .await
+        .expect("get_hash_fields failed");
+    let json = extract_text(result);
+    let fields = json["fields"].as_array().unwrap();
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0]["field"], "a");
+    assert_eq!(fields[0]["value"], "1");
+    assert_eq!(fields[0]["exists"], true);
+    assert_eq!(fields[1]["field"], "c");
+    assert_eq!(fields[1]["value"], "3");
+}
+
+#[tokio::test]
+async fn test_get_hash_fields_missing() {
+    let conn = require_redis!();
+    let mut test_conn = conn.conn.clone();
+    let _: () = redis::cmd("HSET")
+        .arg("h2")
+        .arg("x")
+        .arg("10")
+        .query_async(&mut test_conn)
+        .await
+        .unwrap();
+
+    let server = make_server(conn);
+    let params = HashFieldParams {
+        connection: None,
+        key: "h2".to_string(),
+        fields: "x, nonexistent".to_string(),
+    };
+    let result = server
+        .do_get_hash_fields(params)
+        .await
+        .expect("get_hash_fields failed");
+    let json = extract_text(result);
+    let fields = json["fields"].as_array().unwrap();
+    assert_eq!(fields[0]["exists"], true);
+    assert_eq!(fields[1]["exists"], false);
+}
+
+#[tokio::test]
+async fn test_get_list_range() {
+    let conn = require_redis!();
+    let mut test_conn = conn.conn.clone();
+    let _: () = redis::cmd("RPUSH")
+        .arg("list1")
+        .arg("a")
+        .arg("b")
+        .arg("c")
+        .arg("d")
+        .arg("e")
+        .query_async(&mut test_conn)
+        .await
+        .unwrap();
+
+    let server = make_server(conn);
+
+    // Get subset
+    let params = ListRangeParams {
+        connection: None,
+        key: "list1".to_string(),
+        start: Some(1),
+        stop: Some(3),
+    };
+    let result = server
+        .do_get_list_range(params)
+        .await
+        .expect("get_list_range failed");
+    let json = extract_text(result);
+    let elements = json["elements"].as_array().unwrap();
+    assert_eq!(elements.len(), 3);
+    assert_eq!(elements[0], "b");
+    assert_eq!(elements[2], "d");
+}
+
+#[tokio::test]
+async fn test_get_list_range_full() {
+    let conn = require_redis!();
+    let mut test_conn = conn.conn.clone();
+    let _: () = redis::cmd("RPUSH")
+        .arg("list2")
+        .arg("x")
+        .arg("y")
+        .arg("z")
+        .query_async(&mut test_conn)
+        .await
+        .unwrap();
+
+    let server = make_server(conn);
+    let params = ListRangeParams {
+        connection: None,
+        key: "list2".to_string(),
+        start: None,
+        stop: None,
+    };
+    let result = server
+        .do_get_list_range(params)
+        .await
+        .expect("get_list_range failed");
+    let json = extract_text(result);
+    assert_eq!(json["count"], 3);
+}
+
+#[tokio::test]
+async fn test_get_set_members() {
+    let conn = require_redis!();
+    let mut test_conn = conn.conn.clone();
+    let _: () = redis::cmd("SADD")
+        .arg("myset")
+        .arg("alpha")
+        .arg("beta")
+        .arg("gamma")
+        .query_async(&mut test_conn)
+        .await
+        .unwrap();
+
+    let server = make_server(conn);
+    let params = SetMembersParams {
+        connection: None,
+        key: "myset".to_string(),
+        count: None,
+    };
+    let result = server
+        .do_get_set_members(params)
+        .await
+        .expect("get_set_members failed");
+    let json = extract_text(result);
+    assert_eq!(json["type"], "set");
+    assert_eq!(json["count"], 3);
+}
+
+#[tokio::test]
+async fn test_get_zset_members() {
+    let conn = require_redis!();
+    let mut test_conn = conn.conn.clone();
+    let _: () = redis::cmd("ZADD")
+        .arg("myzset")
+        .arg(1.0)
+        .arg("one")
+        .arg(2.0)
+        .arg("two")
+        .arg(3.0)
+        .arg("three")
+        .query_async(&mut test_conn)
+        .await
+        .unwrap();
+
+    let server = make_server(conn);
+    let params = SetMembersParams {
+        connection: None,
+        key: "myzset".to_string(),
+        count: Some(2),
+    };
+    let result = server
+        .do_get_set_members(params)
+        .await
+        .expect("get_set_members failed");
+    let json = extract_text(result);
+    assert_eq!(json["type"], "zset");
+    assert_eq!(json["count"], 2);
+    let members = json["members"].as_array().unwrap();
+    assert_eq!(members[0]["member"], "one");
+    assert!(members[0]["score"].as_f64().unwrap() > 0.0);
+}
+
+#[tokio::test]
+async fn test_slowlog() {
+    let conn = require_redis!();
+    let server = make_server(conn);
+    let params = SlowlogParams {
+        connection: None,
+        count: Some(5),
+    };
+    let result = server
+        .do_slowlog(params)
+        .await
+        .expect("slowlog failed");
+    let json = extract_text(result);
+    // Slowlog might be empty but should return valid structure
+    assert!(json["entries"].as_array().is_some());
+    assert!(json["count"].as_u64().is_some());
+}
+
+#[tokio::test]
+async fn test_client_list() {
+    let conn = require_redis!();
+    let server = make_server(conn);
+    let params = ConnectionParam { connection: None };
+    let result = server
+        .do_client_list(params)
+        .await
+        .expect("client_list failed");
+    let json = extract_text(result);
+    // At least our own connection should appear
+    assert!(json["count"].as_u64().unwrap() >= 1);
+    let clients = json["clients"].as_array().unwrap();
+    assert!(!clients.is_empty());
+    // Each client should have an addr field
+    assert!(clients[0]["addr"].as_str().is_some());
 }
