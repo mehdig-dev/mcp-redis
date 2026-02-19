@@ -71,7 +71,8 @@ async fn main() -> Result<()> {
         let name = if all_urls.len() == 1 {
             "redis".to_string()
         } else {
-            format!("redis-{}", i)
+            // Extract host:port for meaningful names (like mcp-sql's extract_db_name)
+            extract_connection_name(url_str, i)
         };
 
         // Redact password from URL for display
@@ -98,6 +99,21 @@ async fn main() -> Result<()> {
     running.waiting().await?;
 
     Ok(())
+}
+
+fn extract_connection_name(url_str: &str, index: usize) -> String {
+    if let Ok(parsed) = url::Url::parse(url_str) {
+        let host = parsed.host_str().unwrap_or("unknown");
+        let port = parsed.port().unwrap_or(6379);
+        let db = parsed.path().trim_start_matches('/');
+        if db.is_empty() || db == "0" {
+            format!("{}:{}", host, port)
+        } else {
+            format!("{}:{}/{}", host, port, db)
+        }
+    } else {
+        format!("redis-{}", index)
+    }
 }
 
 fn redact_url(url_str: &str) -> String {

@@ -8,6 +8,9 @@ use serde::Deserialize;
 
 use crate::error::McpRedisError;
 
+/// Maximum number of SCAN iterations as a safety valve
+const MAX_SCAN_ITERATIONS: usize = 1000;
+
 #[derive(Clone)]
 pub struct RedisConnection {
     pub name: String,
@@ -18,7 +21,6 @@ pub struct RedisConnection {
 #[derive(Clone)]
 pub struct McpRedisServer {
     connections: Arc<Vec<RedisConnection>>,
-    #[allow(dead_code)]
     allow_write: bool,
     scan_count: u32,
     tool_router: ToolRouter<Self>,
@@ -93,18 +95,42 @@ impl McpRedisServer {
         }
     }
 
+    /// Guard for future write operations. Currently all tools are read-only,
+    /// but any new write tools should call this first.
+    #[allow(dead_code)]
+    fn check_read_only(&self, operation: &str) -> Result<(), McpRedisError> {
+        if !self.allow_write {
+            return Err(McpRedisError::ReadOnly(format!(
+                "'{}' requires --allow-write flag",
+                operation
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate that a pattern doesn't contain null bytes.
+    fn validate_pattern(pattern: &str) -> Result<(), McpRedisError> {
+        if pattern.contains('\0') {
+            return Err(McpRedisError::Other(
+                "Pattern must not contain null bytes".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn err(&self, e: McpRedisError) -> ErrorData {
         e.to_mcp_error()
     }
 }
 
-#[tool_router]
+// -- Read-only Redis commands for reference --
+// INFO, SCAN, TYPE, GET, LRANGE, SMEMBERS, ZRANGE, HGETALL, TTL, OBJECT, MEMORY, DBSIZE
+// Write commands that would need check_read_only: SET, DEL, FLUSHDB, EXPIRE, etc.
+
+// -- Public methods for testability --
+
 impl McpRedisServer {
-    #[tool(
-        name = "list_connections",
-        description = "List all connected Redis instances with names and connection info (passwords redacted)"
-    )]
-    async fn list_connections(&self) -> Result<CallToolResult, ErrorData> {
+    pub async fn do_list_connections(&self) -> Result<CallToolResult, ErrorData> {
         let connections: Vec<serde_json::Value> = self
             .connections
             .iter()
@@ -121,14 +147,7 @@ impl McpRedisServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(
-        name = "info",
-        description = "Get Redis server info. Optionally specify a section: memory, stats, keyspace, server, clients, etc."
-    )]
-    async fn info(
-        &self,
-        Parameters(params): Parameters<InfoParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+    pub async fn do_info(&self, params: InfoParams) -> Result<CallToolResult, ErrorData> {
         let entry = self.resolve(params.connection.as_deref()).map_err(|e| self.err(e))?;
         let mut conn = entry.conn.clone();
 
@@ -148,21 +167,22 @@ impl McpRedisServer {
         Ok(CallToolResult::success(vec![Content::text(info)]))
     }
 
-    #[tool(
-        name = "scan_keys",
-        description = "Scan keys matching a pattern using SCAN (non-blocking). Returns key names."
-    )]
-    async fn scan_keys(
-        &self,
-        Parameters(params): Parameters<ScanParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+    pub async fn do_scan_keys(&self, params: ScanParams) -> Result<CallToolResult, ErrorData> {
         let entry = self.resolve(params.connection.as_deref()).map_err(|e| self.err(e))?;
         let mut conn = entry.conn.clone();
         let pattern = params.pattern.as_deref().unwrap_or("*");
-        let max_keys = params.count.unwrap_or(self.scan_count) as usize;
+
+        Self::validate_pattern(pattern).map_err(|e| self.err(e))?;
+
+        // Cap max_keys to scan_count to prevent unbounded iteration
+        let max_keys = std::cmp::min(
+            params.count.unwrap_or(self.scan_count) as usize,
+            self.scan_count as usize,
+        );
 
         let mut keys: Vec<String> = Vec::new();
         let mut cursor: u64 = 0;
+        let mut iterations = 0;
 
         loop {
             let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
@@ -177,8 +197,9 @@ impl McpRedisServer {
 
             keys.extend(batch);
             cursor = next_cursor;
+            iterations += 1;
 
-            if cursor == 0 || keys.len() >= max_keys {
+            if cursor == 0 || keys.len() >= max_keys || iterations >= MAX_SCAN_ITERATIONS {
                 break;
             }
         }
@@ -194,14 +215,7 @@ impl McpRedisServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(
-        name = "get",
-        description = "Get the value of a key. Auto-detects the key type (string, hash, list, set, zset) and returns the appropriate representation."
-    )]
-    async fn get(
-        &self,
-        Parameters(params): Parameters<KeyParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+    pub async fn do_get(&self, params: KeyParams) -> Result<CallToolResult, ErrorData> {
         let entry = self.resolve(params.connection.as_deref()).map_err(|e| self.err(e))?;
         let mut conn = entry.conn.clone();
 
@@ -279,14 +293,7 @@ impl McpRedisServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(
-        name = "key_info",
-        description = "Get metadata about a key: type, TTL, encoding, and memory usage"
-    )]
-    async fn key_info(
-        &self,
-        Parameters(params): Parameters<KeyParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+    pub async fn do_key_info(&self, params: KeyParams) -> Result<CallToolResult, ErrorData> {
         let entry = self.resolve(params.connection.as_deref()).map_err(|e| self.err(e))?;
         let mut conn = entry.conn.clone();
 
@@ -325,14 +332,7 @@ impl McpRedisServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(
-        name = "dbsize",
-        description = "Get the number of keys in the current database"
-    )]
-    async fn dbsize(
-        &self,
-        Parameters(params): Parameters<ConnectionParam>,
-    ) -> Result<CallToolResult, ErrorData> {
+    pub async fn do_dbsize(&self, params: ConnectionParam) -> Result<CallToolResult, ErrorData> {
         let entry = self.resolve(params.connection.as_deref()).map_err(|e| self.err(e))?;
         let mut conn = entry.conn.clone();
 
@@ -348,21 +348,22 @@ impl McpRedisServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(
-        name = "search_keys",
-        description = "Scan keys matching a pattern and return each key with its type"
-    )]
-    async fn search_keys(
-        &self,
-        Parameters(params): Parameters<ScanParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+    pub async fn do_search_keys(&self, params: ScanParams) -> Result<CallToolResult, ErrorData> {
         let entry = self.resolve(params.connection.as_deref()).map_err(|e| self.err(e))?;
         let mut conn = entry.conn.clone();
         let pattern = params.pattern.as_deref().unwrap_or("*");
-        let max_keys = params.count.unwrap_or(self.scan_count) as usize;
+
+        Self::validate_pattern(pattern).map_err(|e| self.err(e))?;
+
+        // Cap max_keys to scan_count to prevent unbounded iteration
+        let max_keys = std::cmp::min(
+            params.count.unwrap_or(self.scan_count) as usize,
+            self.scan_count as usize,
+        );
 
         let mut keys: Vec<String> = Vec::new();
         let mut cursor: u64 = 0;
+        let mut iterations = 0;
 
         loop {
             let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
@@ -377,27 +378,33 @@ impl McpRedisServer {
 
             keys.extend(batch);
             cursor = next_cursor;
+            iterations += 1;
 
-            if cursor == 0 || keys.len() >= max_keys {
+            if cursor == 0 || keys.len() >= max_keys || iterations >= MAX_SCAN_ITERATIONS {
                 break;
             }
         }
 
         keys.truncate(max_keys);
 
-        // Get type for each key
+        // Batch TYPE queries using a pipeline instead of N+1 individual calls
         let mut results = Vec::new();
-        for key in &keys {
-            let key_type: String = redis::cmd("TYPE")
-                .arg(key)
+        if !keys.is_empty() {
+            let mut pipe = redis::pipe();
+            for key in &keys {
+                pipe.cmd("TYPE").arg(key);
+            }
+            let types: Vec<String> = pipe
                 .query_async(&mut conn)
                 .await
-                .unwrap_or_else(|_| "unknown".to_string());
+                .unwrap_or_else(|_| vec!["unknown".to_string(); keys.len()]);
 
-            results.push(serde_json::json!({
-                "key": key,
-                "type": key_type,
-            }));
+            for (key, key_type) in keys.iter().zip(types.iter()) {
+                results.push(serde_json::json!({
+                    "key": key,
+                    "type": key_type,
+                }));
+            }
         }
 
         let text = serde_json::to_string_pretty(&serde_json::json!({
@@ -407,6 +414,85 @@ impl McpRedisServer {
         }))
         .unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+}
+
+// -- MCP tool handlers (thin wrappers) --
+
+#[tool_router]
+impl McpRedisServer {
+    #[tool(
+        name = "list_connections",
+        description = "List all connected Redis instances with names and connection info (passwords redacted)"
+    )]
+    async fn list_connections(&self) -> Result<CallToolResult, ErrorData> {
+        self.do_list_connections().await
+    }
+
+    #[tool(
+        name = "info",
+        description = "Get Redis server info. Optionally specify a section: memory, stats, keyspace, server, clients, etc."
+    )]
+    async fn info(
+        &self,
+        Parameters(params): Parameters<InfoParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_info(params).await
+    }
+
+    #[tool(
+        name = "scan_keys",
+        description = "Scan keys matching a pattern using SCAN (non-blocking). Returns key names."
+    )]
+    async fn scan_keys(
+        &self,
+        Parameters(params): Parameters<ScanParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_scan_keys(params).await
+    }
+
+    #[tool(
+        name = "get",
+        description = "Get the value of a key. Auto-detects the key type (string, hash, list, set, zset) and returns the appropriate representation."
+    )]
+    async fn get(
+        &self,
+        Parameters(params): Parameters<KeyParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_get(params).await
+    }
+
+    #[tool(
+        name = "key_info",
+        description = "Get metadata about a key: type, TTL, encoding, and memory usage"
+    )]
+    async fn key_info(
+        &self,
+        Parameters(params): Parameters<KeyParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_key_info(params).await
+    }
+
+    #[tool(
+        name = "dbsize",
+        description = "Get the number of keys in the current database"
+    )]
+    async fn dbsize(
+        &self,
+        Parameters(params): Parameters<ConnectionParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_dbsize(params).await
+    }
+
+    #[tool(
+        name = "search_keys",
+        description = "Scan keys matching a pattern and return each key with its type"
+    )]
+    async fn search_keys(
+        &self,
+        Parameters(params): Parameters<ScanParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_search_keys(params).await
     }
 }
 
